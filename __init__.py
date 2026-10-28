@@ -8,7 +8,7 @@ import comfy.conds
 import comfy.patcher_extension
 import nodes
 from comfy.ldm.minimax.model import FRAME_PER_TOKEN
-from comfy_api.latest import ComfyExtension, io
+from comfy_api.latest import ComfyExtension, io, ui
 
 
 GUIDE_POSITION = "minimax_h3_spatial_guide"
@@ -132,7 +132,8 @@ class MiniMaxH3GuidePosition(io.ComfyNode):
             node_id="MiniMaxH3GuidePosition",
             display_name="MiniMax H3 Guide Position",
             category="model/conditioning/minimax",
-            description="Drag the guide rectangle inside the target canvas. Outputs the guide's top-left x/y in target pixels.",
+            description="Preview the guide's first frame and drag it within the target canvas. Run this node to refresh input dimensions without sampling.",
+            is_output_node=True,
             inputs=[
                 io.Int.Input("guide_width", default=640, min=1, max=nodes.MAX_RESOLUTION),
                 io.Int.Input("guide_height", default=480, min=1, max=nodes.MAX_RESOLUTION),
@@ -140,13 +141,25 @@ class MiniMaxH3GuidePosition(io.ComfyNode):
                 io.Int.Input("canvas_height", default=480, min=1, max=nodes.MAX_RESOLUTION),
                 io.Int.Input("x", default=0, min=-nodes.MAX_RESOLUTION, max=nodes.MAX_RESOLUTION, socketless=True),
                 io.Int.Input("y", default=0, min=-nodes.MAX_RESOLUTION, max=nodes.MAX_RESOLUTION, socketless=True),
+                io.Image.Input("image", optional=True, tooltip="Connect the same image/video batch as Spatial Guide. The first frame determines the guide preview and its actual size."),
+                io.Latent.Input("latent", optional=True, tooltip="Target H3 AV latent. Uses its actual canvas dimensions, including the latent's size alignment."),
             ],
             outputs=[io.Int.Output(display_name="x"), io.Int.Output(display_name="y")],
         )
 
     @classmethod
-    def execute(cls, guide_width, guide_height, canvas_width, canvas_height, x, y) -> io.NodeOutput:
-        return io.NodeOutput(x, y, ui={"guide_size": [guide_width, guide_height], "canvas_size": [canvas_width, canvas_height]})
+    def execute(cls, guide_width, guide_height, canvas_width, canvas_height, x, y, image=None, latent=None) -> io.NodeOutput:
+        preview = {}
+        if image is not None:
+            guide_height, guide_width = image.shape[1:3]
+            preview["guide_preview"] = ui.PreviewImage(image[:1, ..., :3]).as_dict()["images"]
+        if latent is not None:
+            samples = latent["samples"]
+            if not samples.is_nested or len(samples.tensors) != 2 or samples.tensors[0].ndim != 5 or samples.tensors[0].shape[1] != 24:
+                raise ValueError("MiniMaxH3GuidePosition expects a MiniMax H3 AV latent")
+            canvas_height, canvas_width = [size * 16 for size in samples.tensors[0].shape[-2:]]
+        preview.update({"guide_size": [guide_width, guide_height], "canvas_size": [canvas_width, canvas_height]})
+        return io.NodeOutput(x, y, ui=preview)
 
 
 class MiniMaxH3SpatialGuideExtension(ComfyExtension):

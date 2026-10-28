@@ -2,16 +2,19 @@ import asyncio
 import importlib.util
 import math
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from PIL import Image
 import torch
 
 import comfy.cli_args
 comfy.cli_args.args.cpu = True
 
 import comfy.conds
+import execution
 from comfy.ldm.minimax.model import MiniMaxH3Model, PackedLayout, patchify_video
 from comfy.model_patcher import ModelPatcher
 from comfy.nested_tensor import NestedTensor
@@ -141,6 +144,59 @@ class SpatialGuideTests(unittest.TestCase):
         self.assertEqual(result.ui, {"guide_size": [640, 480], "canvas_size": [960, 480]})
         schema = guide.MiniMaxH3GuidePosition.define_schema()
         self.assertEqual([output.display_name for output in schema.outputs], ["x", "y"])
+        self.assertTrue(schema.is_output_node)
+
+    def test_position_previews_first_frame_and_actual_canvas_size(self):
+        images = torch.zeros(2, 48, 65, 3)
+        images[0, ..., 0] = 1
+        images[1, ..., 1] = 1
+        latent = {"samples": NestedTensor([torch.zeros(1, 24, 2, 35, 16), torch.zeros(1, 32, 2, 8)])}
+        with tempfile.TemporaryDirectory() as directory, patch("folder_paths.get_temp_directory", return_value=directory):
+            result = guide.MiniMaxH3GuidePosition.execute(320, 416, 270, 560, -38, 147, image=images, latent=latent)
+            self.assertEqual(result.result, (-38, 147))
+            self.assertEqual(result.ui["guide_size"], [65, 48])
+            self.assertEqual(result.ui["canvas_size"], [256, 560])
+            self.assertEqual(len(result.ui["guide_preview"]), 1)
+            descriptor = result.ui["guide_preview"][0]
+            self.assertEqual(descriptor["type"], "temp")
+            with Image.open(Path(directory) / descriptor["subfolder"] / descriptor["filename"]) as image:
+                self.assertEqual(image.size, (65, 48))
+                self.assertEqual(image.getpixel((0, 0)), (255, 0, 0))
+
+    def test_position_accepts_single_image_preview(self):
+        images = torch.ones(1, 32, 64, 3)
+        with tempfile.TemporaryDirectory() as directory, patch("folder_paths.get_temp_directory", return_value=directory):
+            result = guide.MiniMaxH3GuidePosition.execute(1, 1, 128, 96, 32, 32, image=images)
+            self.assertEqual(result.ui["guide_size"], [64, 32])
+            self.assertEqual(result.ui["canvas_size"], [128, 96])
+
+    def test_partial_execution_refreshes_preview_without_downstream_output(self):
+        events = []
+        server = SimpleNamespace(client_id=None, last_node_id=None, send_sync=lambda event, data, client=None: events.append((event, data)))
+        executor = execution.PromptExecutor(server, cache_args={"ram": 0, "ram_inactive": 0})
+        prompt = {
+            "source": {"class_type": "EmptyImage", "inputs": {"width": 64, "height": 48, "batch_size": 2, "color": 0xFF0000}},
+            "position": {"class_type": "MiniMaxH3GuidePosition", "inputs": {
+                "guide_width": 320, "guide_height": 416, "canvas_width": 128, "canvas_height": 96,
+                "x": 32, "y": 16, "image": ["source", 0],
+            }},
+            "downstream": {"class_type": "PreviewImage", "inputs": {"images": ["position", 0]}},
+        }
+        with tempfile.TemporaryDirectory() as directory, patch("folder_paths.get_temp_directory", return_value=directory), patch.dict(
+            guide.nodes.NODE_CLASS_MAPPINGS, {"MiniMaxH3GuidePosition": guide.MiniMaxH3GuidePosition}
+        ):
+            valid = asyncio.run(execution.validate_prompt("position-preview", prompt, ["position"]))
+            self.assertTrue(valid[0], valid)
+            self.assertEqual(set(valid[2]), {"position"})
+            for prompt_id in ("position-preview", "position-preview-cached"):
+                events.clear()
+                executor.execute(prompt, prompt_id, {"client_id": "position-test"}, valid[2])
+                self.assertTrue(executor.success, executor.status_messages)
+                output = executor.history_result["outputs"]["position"]
+                self.assertEqual(output["guide_size"], [64, 48])
+                self.assertEqual(len(output["guide_preview"]), 1)
+                self.assertNotIn("downstream", executor.history_result["outputs"])
+                self.assertTrue(any(event == "executed" and data["node"] == "position" for event, data in events))
 
 
 if __name__ == "__main__":

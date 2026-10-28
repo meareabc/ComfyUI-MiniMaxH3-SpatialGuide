@@ -1,6 +1,6 @@
 [project]
 name = "minimax-h3-spatial-guide"
-version = "0.1.0"
+version = "0.2.0"
 description = "Native-size spatial guides and drag positioning for MiniMax H3 in ComfyUI"
 readme = "README.md"
 license = { file = "LICENSE" }
